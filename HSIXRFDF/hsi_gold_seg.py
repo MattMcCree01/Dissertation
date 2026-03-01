@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from collections import deque
 
 import numpy as np
 from PIL import Image
@@ -78,6 +79,42 @@ def _pad_if_needed(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     if arr.ndim == 3:
         return np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant")
     return np.pad(arr, ((0, pad_h), (0, pad_w)), mode="constant")
+
+
+def _remove_small_components(binary_mask: np.ndarray, min_area: int) -> np.ndarray:
+    """Remove connected components smaller than min_area (8-connected)."""
+    if min_area <= 1:
+        return binary_mask
+
+    h, w = binary_mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    out = np.zeros((h, w), dtype=bool)
+
+    for y in range(h):
+        for x in range(w):
+            if not binary_mask[y, x] or visited[y, x]:
+                continue
+
+            q = deque([(y, x)])
+            visited[y, x] = True
+            comp = [(y, x)]
+
+            while q:
+                cy, cx = q.popleft()
+                for ny in range(max(0, cy - 1), min(h, cy + 2)):
+                    for nx in range(max(0, cx - 1), min(w, cx + 2)):
+                        if (ny == cy and nx == cx) or visited[ny, nx]:
+                            continue
+                        if binary_mask[ny, nx]:
+                            visited[ny, nx] = True
+                            q.append((ny, nx))
+                            comp.append((ny, nx))
+
+            if len(comp) >= min_area:
+                ys, xs = zip(*comp)
+                out[np.array(ys), np.array(xs)] = True
+
+    return out
 
 
 def discover_processed_pairs(processed_dir: Path) -> Dict[int, Tuple[Path, Path]]:
@@ -465,6 +502,9 @@ def predict(
     threshold: float,
     drop_bands: Optional[int],
     num_bands: Optional[int],
+    connector_mask: Optional[Path],
+    connector_class: int,
+    min_area: int,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(checkpoint, map_location=device)
@@ -487,7 +527,21 @@ def predict(
         raise ValueError(f"Model expects {in_channels} channels but input has {cube.shape[2]} channels after preprocessing.")
 
     prob = _infer_tiled(model, cube, device=device, tile=tile_size, overlap=overlap)
-    mask = (prob >= threshold).astype(np.uint8) * 255
+
+    if connector_mask is not None:
+        connector_raw = _read_envi(connector_mask)
+        if connector_raw.ndim == 3:
+            connector_raw = connector_raw[:, :, 0]
+        connector_region = (connector_raw == connector_class)
+        if connector_region.shape != prob.shape:
+            raise ValueError(
+                f"Connector mask shape {connector_region.shape} does not match prediction shape {prob.shape}."
+            )
+        prob = prob * connector_region.astype(np.float32)
+
+    binary = prob >= threshold
+    binary = _remove_small_components(binary, min_area=min_area)
+    mask = binary.astype(np.uint8) * 255
 
     output_mask.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(mask).save(output_mask)
@@ -523,9 +577,12 @@ def build_parser() -> argparse.ArgumentParser:
     pred.add_argument("--output-mask", type=Path, required=True)
     pred.add_argument("--tile-size", type=int, default=256)
     pred.add_argument("--overlap", type=int, default=64)
-    pred.add_argument("--threshold", type=float, default=0.5)
+    pred.add_argument("--threshold", type=float, default=0.6)
     pred.add_argument("--drop-bands", type=int, default=None)
     pred.add_argument("--num-bands", type=int, default=None)
+    pred.add_argument("--connector-mask", type=Path, default=None, help="Optional ENVI general mask .HDR path used to restrict predictions to a class region.")
+    pred.add_argument("--connector-class", type=int, default=3, help="Class id to keep from connector mask when --connector-mask is provided.")
+    pred.add_argument("--min-area", type=int, default=200, help="Remove predicted components smaller than this many pixels.")
 
     return p
 
@@ -564,6 +621,9 @@ def main() -> None:
             threshold=args.threshold,
             drop_bands=args.drop_bands,
             num_bands=args.num_bands,
+            connector_mask=args.connector_mask,
+            connector_class=args.connector_class,
+            min_area=args.min_area,
         )
         return
 

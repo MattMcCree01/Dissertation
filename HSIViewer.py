@@ -118,18 +118,38 @@ plt.xlabel("Wavelength (nm)")
 plt.ylabel("Intensity")
 plt.grid(True)
 plt.show()
-def get_gold_mask(data, wavelengths, connector_mask=None, red_pct=95, edge_pct=75):
-    """Compute red/blue ratio and red-green edge strength, choose thresholds
-    using percentiles (optionally restricted to connector_mask), and return
-    mask plus diagnostic maps and thresholds.
-    Returns: mask, red_index, edge_strength, red_thresh, edge_thresh
+def get_gold_mask(
+    data,
+    wavelengths,
+    connector_mask=None,
+    red_pct=95,
+    edge_pct=75,
+    slope_pct=80,
+    bright_pct=70,
+):
+    """Build a conservative gold candidate mask from HSI bands.
+
+    Uses four complementary cues:
+      1) red/blue ratio (gold should be high)
+      2) red-green edge strength (gold should be positive)
+      3) 500->600 nm rise (gold often has a sharp increase)
+      4) brightness at 600 nm (avoid dim board/background pixels)
+
+    Thresholds are percentile-based and (when possible) estimated only from
+    connector regions.
+
+    Returns:
+      mask, red_index, edge_strength, rise_500_600, bright_600,
+      red_thresh, edge_thresh, slope_thresh, bright_thresh
     """
     # Find band indices for gold-specific wavelengths
     idx_450 = np.argmin(np.abs(wavelengths - 450))  # Blue
+    idx_500 = np.argmin(np.abs(wavelengths - 500))  # Green-cyan shoulder
     idx_550 = np.argmin(np.abs(wavelengths - 550))  # Green
     idx_600 = np.argmin(np.abs(wavelengths - 600))  # Red-yellow
 
     # Extract bands (float)
+    green_cyan = data[:, :, idx_500].astype(float)
     blue = data[:, :, idx_450].astype(float)
     green = data[:, :, idx_550].astype(float)
     yellow_red = data[:, :, idx_600].astype(float)
@@ -137,29 +157,56 @@ def get_gold_mask(data, wavelengths, connector_mask=None, red_pct=95, edge_pct=7
     # Diagnostic indices
     red_index = yellow_red / (blue + 1e-6)  # ratio of red to blue
     edge_strength = (yellow_red - green) / (yellow_red + green + 1e-6)  # red-green edge
+    rise_500_600 = (yellow_red - green_cyan) / (yellow_red + green_cyan + 1e-6)
+    bright_600 = yellow_red
 
     # Select values used to compute thresholds (prefer connector region if provided)
     if connector_mask is not None and connector_mask.any():
         sample_red = red_index[connector_mask]
         sample_edge = edge_strength[connector_mask]
+        sample_slope = rise_500_600[connector_mask]
+        sample_bright = bright_600[connector_mask]
     else:
         sample_red = red_index.ravel()
         sample_edge = edge_strength.ravel()
+        sample_slope = rise_500_600.ravel()
+        sample_bright = bright_600.ravel()
 
     # Avoid empty samples
     if sample_red.size == 0:
         sample_red = red_index.ravel()
     if sample_edge.size == 0:
         sample_edge = edge_strength.ravel()
+    if sample_slope.size == 0:
+        sample_slope = rise_500_600.ravel()
+    if sample_bright.size == 0:
+        sample_bright = bright_600.ravel()
 
     # Percentile-based automatic thresholds
     red_thresh = float(np.percentile(sample_red, red_pct))
     edge_thresh = float(np.percentile(sample_edge, edge_pct))
+    slope_thresh = float(np.percentile(sample_slope, slope_pct))
+    bright_thresh = float(np.percentile(sample_bright, bright_pct))
 
     # Final mask: require both a high red/blue ratio and a strong red-green edge
-    mask = (red_index >= red_thresh) & (edge_strength >= edge_thresh)
+    mask = (
+        (red_index >= red_thresh)
+        & (edge_strength >= edge_thresh)
+        & (rise_500_600 >= slope_thresh)
+        & (bright_600 >= bright_thresh)
+    )
 
-    return mask, red_index, edge_strength, red_thresh, edge_thresh
+    return (
+        mask,
+        red_index,
+        edge_strength,
+        rise_500_600,
+        bright_600,
+        red_thresh,
+        edge_thresh,
+        slope_thresh,
+        bright_thresh,
+    )
 
 # Load general segmentation mask and isolate connector regions (class 3)
 gm_path = script_dir / 'PCBDataset' / 'PCBDataset' / 'HSI' / 'General_masks' / '1'
@@ -180,8 +227,24 @@ else:
     print("General mask not found — running detection on full image")
 
 # Run gold detection using percentiles computed inside connector regions
-mask_all, red_index, edge_strength, red_thr, edge_thr = get_gold_mask(
-    data, wavelengths, connector_mask=connector_region, red_pct=95, edge_pct=75
+(
+    mask_all,
+    red_index,
+    edge_strength,
+    rise_500_600,
+    bright_600,
+    red_thr,
+    edge_thr,
+    slope_thr,
+    bright_thr,
+) = get_gold_mask(
+    data,
+    wavelengths,
+    connector_mask=connector_region,
+    red_pct=97,
+    edge_pct=85,
+    slope_pct=85,
+    bright_pct=75,
 )
 
 # Restrict to connectors
@@ -191,23 +254,28 @@ mask = mask_all & connector_region
 rgb_view = data[:, :, rgb_bands].astype(np.float32)
 rgb_view = (rgb_view - rgb_view.min(axis=(0,1))) / (rgb_view.max(axis=(0,1)) - rgb_view.min(axis=(0,1)) + 1e-6)
 
-plt.figure(figsize=(18, 5))
-plt.subplot(1, 4, 1)
+plt.figure(figsize=(22, 5))
+plt.subplot(1, 5, 1)
 plt.title(f"Red/Blue Ratio (thr={red_thr:.2f})")
 plt.imshow(red_index, cmap='viridis')
 plt.colorbar()
 
-plt.subplot(1, 4, 2)
+plt.subplot(1, 5, 2)
 plt.title(f"Red-Green Edge (thr={edge_thr:.2f})")
 plt.imshow(edge_strength, cmap='YlOrBr')
 plt.colorbar()
 
-plt.subplot(1, 4, 3)
+plt.subplot(1, 5, 3)
+plt.title(f"500→600 Rise (thr={slope_thr:.2f})")
+plt.imshow(rise_500_600, cmap='inferno')
+plt.colorbar()
+
+plt.subplot(1, 5, 4)
 plt.title("Connector Regions (class 3)")
 plt.imshow(connector_region, cmap='gray')
 plt.colorbar()
 
-plt.subplot(1, 4, 4)
+plt.subplot(1, 5, 5)
 plt.title("Gold in Connectors (final)")
 plt.imshow(rgb_view)
 plt.imshow(mask, alpha=0.6, cmap='jet')
@@ -216,5 +284,11 @@ plt.colorbar()
 plt.tight_layout()
 plt.show()
 
-print(f"Thresholds used: red_index >= {red_thr:.3f}, edge_strength >= {edge_thr:.3f}")
+print(
+    "Thresholds used: "
+    f"red_index >= {red_thr:.3f}, "
+    f"edge_strength >= {edge_thr:.3f}, "
+    f"rise_500_600 >= {slope_thr:.3f}, "
+    f"bright_600 >= {bright_thr:.3f}"
+)
 print(f"Gold candidate pixels (within connectors): {np.count_nonzero(mask)}")
