@@ -1,0 +1,4 @@
+spectral>=0.23
+numpy>=1.22
+matplotlib>=3.7
+Pillow>=9.0
